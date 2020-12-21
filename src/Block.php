@@ -12,13 +12,11 @@ use Riclep\Storyblok\Fields\MultiAsset;
 use Riclep\Storyblok\Fields\RichText;
 use Riclep\Storyblok\Fields\Table;
 use Riclep\Storyblok\Traits\CssClasses;
-use Riclep\Storyblok\Traits\HasChildClasses;
 use Riclep\Storyblok\Traits\HasMeta;
 
 class Block implements \IteratorAggregate
 {
 	use CssClasses;
-	use HasChildClasses;
 	use HasMeta;
 
 	/**
@@ -50,6 +48,8 @@ class Block implements \IteratorAggregate
 	 * @var Page|Block reference to the parent Block or Page
 	 */
 	private $_parent;
+	/** @var ProcessFields */
+	private $processFields;
 
 	/**
 	 * Takes the Block’s content and a reference to the parent
@@ -64,7 +64,8 @@ class Block implements \IteratorAggregate
 
 		$this->_componentPath = array_merge($parent->_componentPath, [Str::lower($this->meta()['component'])]);
 
-		$this->processFields();
+		$processFields = new ProcessFields($this);
+		$processFields->processFields();
 
 		// run automatic traits - methods matching initTraitClassName()
 		foreach (class_uses_recursive($this) as $trait) {
@@ -80,6 +81,22 @@ class Block implements \IteratorAggregate
 	 * @return Collection
 	 */
 	public function content() {
+		return $this->_fields;
+	}
+
+	/**
+	 * @return array
+	 */
+	public function getCasts(): array
+	{
+		return $this->_casts;
+	}
+
+	/**
+	 * @return Collection
+	 */
+	public function getFields(): Collection
+	{
 		return $this->_fields;
 	}
 
@@ -236,157 +253,7 @@ class Block implements \IteratorAggregate
 	}
 
 	/**
-	 * Loops over every field to get te ball rolling
-	 */
-	private function processFields() {
-		$this->_fields->transform(function ($field, $key) {
-			return $this->getFieldType($field, $key);
-		});
-	}
-
-	/**
-	 * Converts fields into Field Classes based on various properties of their content
-	 *
-	 * @param $field
-	 * @param $key
-	 * @return array|Collection|mixed|Asset|Image|MultiAsset|RichText|Table
-	 * @throws \Storyblok\ApiException
-	 */
-	private function getFieldType($field, $key) {
-		// TODO process old asset fields
-		// TODO option to convert all text fields to a class - single or multiline?
-
-		// does the Block assign any $_casts? This is key (field) => value (class)
-		if (property_exists($this, '_casts') && array_key_exists($key, $this->_casts)) {
-			return new $this->_casts[$key]($field, $this);
-		}
-
-		// find Fields specific to this Block matching: BlockNameFieldName
-		if ($class = $this->getChildClassName('Field', $this->component() . '_' . $key)) {
-			return new $class($field, $this);
-		}
-
-		// auto-match Field classes
-		if ($class = $this->getChildClassName('Field', $key)) {
-			return new $class($field, $this);
-		}
-
-		// single item relations
-		if (Str::isUuid($field) && ($this->_autoResolveRelations || in_array($key, $this->_resolveRelations))) {
-			return $this->getRelation(new RequestStory(), $field);
-		}
-
-		// complex fields
-		if (is_array($field) && !empty($field)) {
-			return $this->arrayFieldTypes($field, $key);
-		}
-
-		// legacy image fields
-		if (is_string($field) && Str::endsWith($field, ['.jpg', '.jpeg', '.png', '.gif', '.webp'])) {
-			return new Image($field, $this);
-		}
-
-		// strings or anything else - do nothing
-		return $field;
-	}
-
-
-	/**
-	 * When the field is an array we need to do more processing
-	 *
-	 * @param $field
-	 * @return Collection|mixed|Asset|Image|MultiAsset|RichText|Table
-	 */
-	private function arrayFieldTypes($field, $key) {
-		// match link fields
-		if (array_key_exists('linktype', $field)) {
-			$class = 'Riclep\Storyblok\Fields\\' . Str::studly($field['linktype']) . 'Link';
-
-			return new $class($field, $this);
-		}
-
-		// match rich-text fields
-		if (array_key_exists('type', $field) && $field['type'] === 'doc') {
-			return new RichText($field, $this);
-		}
-
-		// match asset fields - detecting raster images
-		if (array_key_exists('fieldtype', $field) && $field['fieldtype'] === 'asset') {
-			if (Str::endsWith($field['filename'], ['.jpg', '.jpeg', '.png', '.gif', '.webp'])) {
-				return new Image($field, $this);
-			}
-
-			return new Asset($field, $this);
-		}
-
-		// match table fields
-		if (array_key_exists('fieldtype', $field) && $field['fieldtype'] === 'table') {
-			return new Table($field, $this);
-		}
-
-		if (array_key_exists(0, $field)) {
-			// it’s an array of relations - request them if we’re auto or manual resolving
-			if (Str::isUuid($field[0])) {
-				if ($this->_autoResolveRelations || in_array($key, $this->_resolveRelations)) {
-					return collect($field)->transform(function ($relation) {
-						return $this->getRelation(new RequestStory(), $relation);
-					});
-				}
-			}
-
-			// has child items - single option, multi option and Blocks fields
-			if (is_array($field[0])) {
-				// resolved relationships - entire story is returned, we just want the content and a few meta items
-				if (array_key_exists('content', $field[0])) {
-					return collect($field)->transform(function ($relation) {
-						$class = $this->getChildClassName('Block', $relation['content']['component']);
-						$relationClass = new $class($relation['content'], $this);
-
-						$relationClass->addMeta([
-							'name' => $relation['name'],
-							'published_at' => $relation['published_at'],
-							'full_slug' => $relation['full_slug'],
-						]);
-
-						return $relationClass;
-					});
-				}
-
-				// this field holds blocks!
-				if (array_key_exists('component', $field[0])) {
-					return collect($field)->transform(function ($block) {
-						$class = $this->getChildClassName('Block', $block['component']);
-
-						return new $class($block, $this);
-					});
-				}
-
-				// multi assets
-				if (array_key_exists('filename', $field[0])) {
-					return new MultiAsset($field, $this);
-				}
-			}
-		}
-
-		// just return the array
-		return $field;
-	}
-
-	/**
-	 * Storyblok returns fields and other meta content at the same level so
-	 * let’s do a little tidying up first
-	 *
-	 * @param $content
-	 */
-	private function preprocess($content) {
-		$this->_fields = collect(array_diff_key($content, array_flip(['_editable', '_uid', 'component'])));
-
-		// remove non-content keys
-		$this->_meta = array_intersect_key($content, array_flip(['_editable', '_uid', 'component']));
-	}
-
-	/**
-	 * Returns cotent of the field. In the visual editor it returns a VueJS template tag
+	 * Returns content of the field. In the visual editor it returns a VueJS template tag
 	 *
 	 * @param $field
 	 * @return string
@@ -418,6 +285,19 @@ class Block implements \IteratorAggregate
 	}
 
 	/**
+	 * Storyblok returns fields and other meta content at the same level so
+	 * let’s do a little tidying up first
+	 *
+	 * @param $content
+	 */
+	private function preprocess($content) {
+		$this->_fields = collect(array_diff_key($content, array_flip(['_editable', '_uid', 'component'])));
+
+		// remove non-content keys
+		$this->_meta = array_intersect_key($content, array_flip(['_editable', '_uid', 'component']));
+	}
+
+	/**
 	 * Let’s up loop over the fields in Blade without needing to
 	 * delve deep into the content collection
 	 *
@@ -425,20 +305,5 @@ class Block implements \IteratorAggregate
 	 */
 	public function getIterator() {
 		return $this->_fields;
-	}
-
-	protected function getRelation(RequestStory $request, $relation) {
-		$response = $request->get($relation);
-
-		$class = $this->getChildClassName('Block', $response['content']['component']);
-		$relationClass = new $class($response['content'], $this);
-
-		$relationClass->addMeta([
-			'name' => $response['name'],
-			'published_at' => $response['published_at'],
-			'full_slug' => $response['full_slug'],
-		]);
-
-		return $relationClass;
 	}
 }
